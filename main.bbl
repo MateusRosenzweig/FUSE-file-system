@@ -1,0 +1,23 @@
+\begin{thebibliography}{}
+
+\bibitem[{Projeto libfuse} sda]{passthrough}
+{Projeto libfuse} (s.d.a).
+\newblock Código-fonte do exemplo passthrough.c.
+\newblock
+  \url{https://github.com/libfuse/libfuse/blob/master/example/passthrough.c}.
+\newblock Acesso em: 29 out. 2026. Substituir master pelo commit utilizado no
+  projeto.
+
+\bibitem[{Projeto libfuse} sdb]{libfuse}
+{Projeto libfuse} (s.d.b).
+\newblock libfuse: Readme e documentação do projeto.
+\newblock \url{https://github.com/libfuse/libfuse}.
+\newblock Acesso em: 29 out. 2026.
+
+\bibitem[{Projeto libfuse} sdc]{operacoes}
+{Projeto libfuse} (s.d.c).
+\newblock Referência da estrutura fuse\_operations.
+\newblock \url{https://libfuse.github.io/doxygen/structfuse__operations.html}.
+\newblock Acesso em: 29 out. 2026.
+
+\end{thebibliography}
