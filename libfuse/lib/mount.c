@@ -1,0 +1,1132 @@
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  Architecture specific file system mounting (Linux).
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file LGPL2.txt.
+*/
+
+/* For environ */
+#define _GNU_SOURCE
+
+#include "fuse_config.h"
+#include "fuse_i.h"
+#include "fuse_misc.h"
+#include "fuse_opt.h"
+#include "mount_util.h"
+#include "mount_i_linux.h"
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <stddef.h>
+#include <string.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <sys/ioctl.h>
+
+#include "fuse_mount_compat.h"
+
+#define FUSERMOUNT_PROG		"fusermount3"
+#define FUSE_COMMFD_ENV		"_FUSE_COMMFD"
+#define FUSE_COMMFD2_ENV	"_FUSE_COMMFD2"
+#define ARG_FD_ENTRY_SIZE	30
+
+	enum { KEY_KERN_FLAG,
+	       KEY_KERN_OPT,
+	       KEY_FUSERMOUNT_OPT,
+	       KEY_SUBTYPE_OPT,
+	       KEY_MTAB_OPT,
+	       KEY_ALLOW_OTHER,
+	       KEY_RO,
+	};
+
+#define FUSE_MOUNT_OPT(t, p) { t, offsetof(struct mount_opts, p), 1 }
+
+static const struct fuse_opt fuse_mount_opts[] = {
+	FUSE_MOUNT_OPT("allow_other",		allow_other),
+	FUSE_MOUNT_OPT("blkdev",		blkdev),
+	FUSE_MOUNT_OPT("auto_unmount",		auto_unmount),
+	FUSE_MOUNT_OPT("fsname=%s",		fsname),
+	FUSE_MOUNT_OPT("max_read=%u",		max_read),
+	FUSE_MOUNT_OPT("subtype=%s",		subtype),
+	FUSE_OPT_KEY("allow_other",		KEY_KERN_OPT),
+	FUSE_OPT_KEY("auto_unmount",		KEY_FUSERMOUNT_OPT),
+	FUSE_OPT_KEY("blkdev",			KEY_FUSERMOUNT_OPT),
+	FUSE_OPT_KEY("fsname=",			KEY_FUSERMOUNT_OPT),
+	FUSE_OPT_KEY("subtype=",		KEY_SUBTYPE_OPT),
+	FUSE_OPT_KEY("blksize=",		KEY_KERN_OPT),
+	FUSE_OPT_KEY("default_permissions",	KEY_KERN_OPT),
+	FUSE_OPT_KEY("context=",		KEY_KERN_OPT),
+	FUSE_OPT_KEY("fscontext=",		KEY_KERN_OPT),
+	FUSE_OPT_KEY("defcontext=",		KEY_KERN_OPT),
+	FUSE_OPT_KEY("rootcontext=",		KEY_KERN_OPT),
+	FUSE_OPT_KEY("max_read=",		KEY_KERN_OPT),
+	FUSE_OPT_KEY("user=",			KEY_MTAB_OPT),
+	FUSE_OPT_KEY("-n",			KEY_MTAB_OPT),
+	FUSE_OPT_KEY("-r",			KEY_RO),
+	FUSE_OPT_KEY("ro",			KEY_KERN_FLAG),
+	FUSE_OPT_KEY("rw",			KEY_KERN_FLAG),
+	FUSE_OPT_KEY("suid",			KEY_KERN_FLAG),
+	FUSE_OPT_KEY("nosuid",			KEY_KERN_FLAG),
+	FUSE_OPT_KEY("dev",			KEY_KERN_FLAG),
+	FUSE_OPT_KEY("nodev",			KEY_KERN_FLAG),
+	FUSE_OPT_KEY("exec",			KEY_KERN_FLAG),
+	FUSE_OPT_KEY("noexec",			KEY_KERN_FLAG),
+	FUSE_OPT_KEY("async",			KEY_KERN_FLAG),
+	FUSE_OPT_KEY("sync",			KEY_KERN_FLAG),
+	FUSE_OPT_KEY("dirsync",			KEY_KERN_FLAG),
+	FUSE_OPT_KEY("noatime",			KEY_KERN_FLAG),
+	FUSE_OPT_KEY("nodiratime",		KEY_KERN_FLAG),
+	FUSE_OPT_KEY("nostrictatime",		KEY_KERN_FLAG),
+	FUSE_OPT_KEY("symfollow",		KEY_KERN_FLAG),
+	FUSE_OPT_KEY("nosymfollow",		KEY_KERN_FLAG),
+	FUSE_OPT_END
+};
+
+/*
+ * Running fusermount by calling 'posix_spawn'
+ *
+ * @param out_pid might be NULL
+ */
+static int fusermount_posix_spawn(posix_spawn_file_actions_t *action,
+				  char const * const argv[], pid_t *out_pid)
+{
+	const char *full_path = FUSERMOUNT_DIR "/" FUSERMOUNT_PROG;
+	pid_t pid;
+
+	/* See man 7 environ for the global environ pointer */
+
+	/* first try the install path */
+	int status = posix_spawn(&pid, full_path,  action, NULL,
+				 (char * const *) argv, environ);
+	if (status != 0) {
+		/* if that fails, try a system install */
+		status = posix_spawnp(&pid, FUSERMOUNT_PROG, action, NULL,
+				      (char * const *) argv, environ);
+	}
+
+	if (status != 0) {
+		fuse_log(FUSE_LOG_ERR, "Failed to call '%s': %s\n",
+			 FUSERMOUNT_PROG, strerror(status));
+		return -status;
+	}
+
+	if (out_pid)
+		*out_pid = pid;
+	else
+		waitpid(pid, NULL, 0); /* FIXME: check exit code and return error if any */
+
+	return 0;
+}
+
+/*
+ * Redirect the child's stdout into @p pipe_fds and leave it neither end.
+ * @return 0 on success, an errno value on failure.
+ */
+static int add_stdout_pipe_actions(posix_spawn_file_actions_t *action,
+				   const int pipe_fds[2])
+{
+	int status;
+
+	status = posix_spawn_file_actions_addclose(action, pipe_fds[0]);
+	if (status == 0)
+		status = posix_spawn_file_actions_adddup2(action, pipe_fds[1],
+							  STDOUT_FILENO);
+	if (status == 0)
+		status = posix_spawn_file_actions_addclose(action, pipe_fds[1]);
+
+	return status;
+}
+
+/* A broken or hostile fusermount3 may write without end. */
+#define FUSERMOUNT_OUTPUT_MAX	(64 * 1024)
+
+/*
+ * Read @p fd until EOF into a NUL-terminated string. No bytes gives "".
+ * @param[in]  max_size Fail instead of growing past this many bytes.
+ * @param[out] outputp Allocated string, freed by the caller.
+ * @return 0 on success, -1 on read, size or allocation failure.
+ */
+static int read_fd_to_string(int fd, size_t max_size, char **outputp)
+{
+	char read_buf[BUFSIZ];
+	char *output = NULL;
+	size_t output_size = 0;
+	ssize_t read_size;
+	int ret = -1;
+
+	while ((read_size = read(fd, read_buf, sizeof(read_buf))) != 0) {
+		char *new_output;
+
+		if (read_size == -1) {
+			if (errno == EINTR)
+				continue;
+			goto out;
+		}
+
+		if (output_size + (size_t) read_size > max_size)
+			goto out;
+
+		new_output = realloc(output, output_size + read_size + 1);
+		if (new_output == NULL)
+			goto out;
+		output = new_output;
+		memcpy(output + output_size, read_buf, read_size);
+		output_size += read_size;
+		output[output_size] = '\0';
+	}
+
+	if (output == NULL) {
+		output = strdup("");
+		if (output == NULL)
+			goto out;
+	}
+
+	*outputp = output;
+	output = NULL;
+	ret = 0;
+
+out:
+	free(output);
+	return ret;
+}
+
+/*
+ * Run fusermount3 with one option and capture stdout.
+ * The caller owns the allocated @p outputp buffer.
+ * @return Child exit status, or -1 before a normal child exit.
+ */
+static int fusermount_capture_output(const char *option, char **outputp)
+{
+	char const *const argv[] = {FUSERMOUNT_PROG, option, NULL};
+	char *output = NULL;
+	posix_spawn_file_actions_t action;
+	pid_t pid;
+	int pipe_fds[2];
+	int child_status;
+	int spawn_status;
+	int read_status = -1;
+	int ret = -1;
+
+	*outputp = NULL;
+	if (pipe(pipe_fds) == -1)
+		return -1;
+
+	spawn_status = posix_spawn_file_actions_init(&action);
+	if (spawn_status == 0) {
+		spawn_status = add_stdout_pipe_actions(&action, pipe_fds);
+		if (spawn_status == 0)
+			spawn_status = fusermount_posix_spawn(&action, argv,
+							      &pid);
+		posix_spawn_file_actions_destroy(&action);
+	}
+
+	/* the child owns the write end now; read() only sees EOF once ours is gone */
+	close(pipe_fds[1]);
+
+	if (spawn_status == 0)
+		read_status = read_fd_to_string(pipe_fds[0],
+						FUSERMOUNT_OUTPUT_MAX, &output);
+
+	/* SIGPIPE ends a helper still writing, so waitpid() cannot block */
+	close(pipe_fds[0]);
+	if (spawn_status != 0)
+		goto out;
+
+	while (waitpid(pid, &child_status, 0) == -1) {
+		if (errno == EINTR)
+			continue;
+		goto out;
+	}
+
+	if (read_status != 0 || !WIFEXITED(child_status))
+		goto out;
+
+	*outputp = output;
+	output = NULL;
+	ret = WEXITSTATUS(child_status);
+
+out:
+	free(output);
+	return ret;
+}
+
+/*
+ * Check whether @p output contains @p word as a complete word.
+ * Whitespace boundaries prevent matching option prefixes.
+ * @return true if @p word occurs as a complete word.
+ */
+static bool fusermount_output_has_word(const char *output, const char *word)
+{
+	size_t word_len = strlen(word);
+	const char *match = output;
+
+	while ((match = strstr(match, word)) != NULL) {
+		if ((match == output || isspace((unsigned char) match[-1])) &&
+		    (match[word_len] == '\0' ||
+		     isspace((unsigned char) match[word_len])))
+			return true;
+		match += word_len;
+	}
+
+	return false;
+}
+
+/*
+ * Convert one hexadecimal digit to its numeric value.
+ * @return 0 to 15, or -1 for a non-hexadecimal byte.
+ */
+static int fusermount_hex_digit_value(char digit)
+{
+	if (digit >= '0' && digit <= '9')
+		return digit - '0';
+	if (digit >= 'a' && digit <= 'f')
+		return digit - 'a' + 10;
+	if (digit >= 'A' && digit <= 'F')
+		return digit - 'A' + 10;
+
+	return -1;
+}
+
+/*
+ * Decode @p output from hexadecimal, most significant digit first.
+ * @return 0 on success, -1 for malformed output.
+ */
+static int fusermount_parse_features(const char *output, uint64_t *featuresp)
+{
+	uint64_t features = 0;
+	size_t output_len = strlen(output);
+
+	if (output_len == sizeof(features) * 2 + 1 &&
+	    output[output_len - 1] == '\n')
+		output_len--;
+	if (output_len != sizeof(features) * 2)
+		return -1;
+
+	/* one hex digit at a time, left to right: every further digit shifts
+	 * the value read so far up by one digit, i.e. 4 bits
+	 */
+	for (size_t digit_idx = 0; digit_idx < output_len; digit_idx++) {
+		int digit_value = fusermount_hex_digit_value(output[digit_idx]);
+
+		if (digit_value < 0)
+			return -1;
+		features = (features << 4) | (uint64_t) digit_value;
+	}
+
+	*featuresp = features;
+	return 0;
+}
+
+/*
+ * Obtain supported feature bits from fusermount3.
+ */
+uint64_t fuse_mount_fusermount_features(void)
+{
+	uint64_t features;
+	char *output;
+	int status;
+
+	/* Older versions reject --features, so probe --help first. */
+	status = fusermount_capture_output("--help", &output);
+	if (status < 0)
+		return 0;
+	if (!fusermount_output_has_word(output, "--features")) {
+		free(output);
+		return 0;
+	}
+	free(output);
+
+	status = fusermount_capture_output("--features", &output);
+	if (status != 0) {
+		free(output);
+		return 0;
+	}
+
+	status = fusermount_parse_features(output, &features);
+	free(output);
+	if (status != 0)
+		return 0;
+
+	return features;
+}
+
+void fuse_mount_version(void)
+{
+	char const *const argv[] = {FUSERMOUNT_PROG, "--version", NULL};
+	int status = fusermount_posix_spawn(NULL, argv, NULL);
+
+	if(status != 0)
+		fuse_log(FUSE_LOG_ERR, "Running '%s --version' failed",
+			 FUSERMOUNT_PROG);
+}
+
+unsigned int get_max_read(const struct mount_opts *o)
+{
+	return o->max_read;
+}
+
+static void set_mount_flag(const char *s, int *flags)
+{
+	int i;
+
+	for (i = 0; mount_flags[i].opt != NULL; i++) {
+		const char *opt = mount_flags[i].opt;
+		if (strcmp(opt, s) == 0) {
+			if (mount_flags[i].on)
+				*flags |= mount_flags[i].flag;
+			else
+				*flags &= ~mount_flags[i].flag;
+			return;
+		}
+	}
+	fuse_log(FUSE_LOG_ERR, "fuse: internal error, can't find mount flag\n");
+	abort();
+}
+
+static int fuse_mount_opt_proc(void *data, const char *arg, int key,
+			       struct fuse_args *outargs)
+{
+	(void) outargs;
+	struct mount_opts *mo = data;
+
+	switch (key) {
+	case KEY_RO:
+		arg = "ro";
+		/* fall through */
+	case KEY_KERN_FLAG:
+		set_mount_flag(arg, &mo->flags);
+		return 0;
+
+	case KEY_KERN_OPT:
+		return fuse_opt_add_opt(&mo->kernel_opts, arg);
+
+	case KEY_FUSERMOUNT_OPT:
+		return fuse_opt_add_opt_escaped(&mo->fusermount_opts, arg);
+
+	case KEY_SUBTYPE_OPT:
+		return fuse_opt_add_opt(&mo->subtype_opt, arg);
+
+	case KEY_MTAB_OPT:
+		return fuse_opt_add_opt(&mo->mtab_opts, arg);
+
+	/* Third party options like 'x-gvfs-notrash' */
+	case FUSE_OPT_KEY_OPT:
+		return (strncmp("x-", arg, 2) == 0) ?
+			fuse_opt_add_opt(&mo->mtab_opts, arg) :
+			1;
+	}
+
+	/* Pass through unknown options */
+	return 1;
+}
+
+/* return value:
+ * >= 0	 => fd
+ * -1	 => error
+ */
+static int receive_fd(int fd)
+{
+	struct msghdr msg;
+	struct iovec iov;
+	char buf[1];
+	int rv;
+	size_t ccmsg[CMSG_SPACE(sizeof(int)) / sizeof(size_t)];
+	struct cmsghdr *cmsg;
+
+	iov.iov_base = buf;
+	iov.iov_len = 1;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_name = 0;
+	msg.msg_namelen = 0;
+	msg.msg_iov = &iov;
+	msg.msg_iovlen = 1;
+	msg.msg_control = ccmsg;
+	msg.msg_controllen = sizeof(ccmsg);
+
+	while(((rv = recvmsg(fd, &msg, 0)) == -1) && errno == EINTR);
+	if (rv == -1) {
+		fuse_log(FUSE_LOG_ERR, "recvmsg failed: %s", strerror(errno));
+		return -1;
+	}
+	if(!rv) {
+		/* EOF */
+		return -1;
+	}
+
+	cmsg = CMSG_FIRSTHDR(&msg);
+	if (!cmsg) {
+		fuse_log(FUSE_LOG_ERR, "error retrieving control message header\n");
+		return -1;
+	}
+	if (cmsg->cmsg_type != SCM_RIGHTS) {
+		fuse_log(FUSE_LOG_ERR, "got control message of unknown type %d\n",
+			cmsg->cmsg_type);
+		return -1;
+	}
+	return *(int*)CMSG_DATA(cmsg);
+}
+
+void fuse_kern_unmount(const char *mountpoint, int fd)
+{
+	int res;
+
+	if (fd != -1) {
+		struct pollfd pfd;
+
+		pfd.fd = fd;
+		pfd.events = 0;
+		res = poll(&pfd, 1, 0);
+
+		/* Need to close file descriptor, otherwise synchronous umount
+		   would recurse into filesystem, and deadlock.
+
+		   Caller expects fuse_kern_unmount to close the fd, so close it
+		   anyway. */
+		close(fd);
+
+		/* If file poll returns POLLERR on the device file descriptor,
+		   then the filesystem is already unmounted or the connection
+		   was severed via /sys/fs/fuse/connections/NNN/abort */
+		if (res == 1 && (pfd.revents & POLLERR))
+			return;
+	}
+
+	if (geteuid() == 0) {
+		fuse_mnt_umount("fuse", mountpoint, mountpoint,  1);
+		return;
+	}
+
+	res = umount2(mountpoint, MNT_DETACH | UMOUNT_NOFOLLOW);
+	if (res == 0)
+		return;
+
+	char const * const argv[] =
+		{ FUSERMOUNT_PROG, "--unmount", "--quiet", "--lazy",
+				"--", mountpoint, NULL };
+	int status = fusermount_posix_spawn(NULL, argv, NULL);
+	if(status != 0) {
+		fuse_log(FUSE_LOG_ERR, "Spawning %s to unmount failed: %s",
+			 FUSERMOUNT_PROG, strerror(-status));
+		return;
+	}
+}
+
+/**
+ * @brief Spawn the fusermount3 helper that unmounts when its socket closes.
+ *
+ * @param[in] mountpoint  mountpoint the helper is to unmount
+ * @param[in] quiet       redirect the helper's stdout/stderr to /dev/null
+ * @return socket fd, to be held open for as long as the mount shall live,
+ *         -1 on failure
+ */
+int setup_auto_unmount(const char *mountpoint, int quiet)
+{
+	int fds[2];
+	pid_t pid;
+	int res;
+
+	if (!mountpoint) {
+		fuse_log(FUSE_LOG_ERR, "fuse: missing mountpoint parameter\n");
+		return -1;
+	}
+
+	res = socketpair(PF_UNIX, SOCK_STREAM, 0, fds);
+	if(res == -1) {
+		fuse_log(FUSE_LOG_ERR, "Setting up auto-unmount socketpair() failed: %s\n",
+			 strerror(errno));
+		return -1;
+	}
+
+	char arg_fd_entry[ARG_FD_ENTRY_SIZE];
+	snprintf(arg_fd_entry, sizeof(arg_fd_entry), "%i", fds[0]);
+	setenv(FUSE_COMMFD_ENV, arg_fd_entry, 1);
+	/*
+	 * This helps to identify the FD hold by parent process.
+	 * In auto-unmount case, parent process can close this FD explicitly to do unmount.
+	 * The FD[1] can be got via getenv(FUSE_COMMFD2_ENV).
+	 * One potential use case is to satisfy FD-Leak checks.
+	 */
+	snprintf(arg_fd_entry, sizeof(arg_fd_entry), "%i", fds[1]);
+	setenv(FUSE_COMMFD2_ENV, arg_fd_entry, 1);
+
+	char const *const argv[] = {
+		FUSERMOUNT_PROG,
+		"--auto-unmount",
+		"--",
+		mountpoint,
+		NULL,
+	};
+
+	// TODO: add error handling for all manipulations of action.
+	posix_spawn_file_actions_t action;
+	posix_spawn_file_actions_init(&action);
+
+	if (quiet) {
+		posix_spawn_file_actions_addopen(&action, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+		posix_spawn_file_actions_addopen(&action, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+	}
+	posix_spawn_file_actions_addclose(&action, fds[1]);
+
+	/*
+	 * auto-umount runs in the background - it is not waiting for the
+	 * process
+	 */
+	int status = fusermount_posix_spawn(&action, argv, &pid);
+
+	posix_spawn_file_actions_destroy(&action);
+
+	if(status != 0) {
+		close(fds[0]);
+		close(fds[1]);
+		fuse_log(FUSE_LOG_ERR, "fuse: Setting up auto-unmount failed (spawn): %s",
+			     strerror(-status));
+		return -1;
+	}
+	// passed to child now, so can close here.
+	close(fds[0]);
+
+	// Now fusermount3 will only exit when fds[1] is closed.
+	return fds[1];
+	// Note: fds[1] doesn't get FD_CLOEXEC
+}
+
+static int fuse_mount_fusermount(const char *mountpoint, const struct mount_opts *mo,
+		const char *opts, int quiet)
+{
+	int fds[2];
+	pid_t pid;
+	int res;
+
+	if (!mountpoint) {
+		fuse_log(FUSE_LOG_ERR, "fuse: missing mountpoint parameter\n");
+		return -1;
+	}
+
+	res = socketpair(PF_UNIX, SOCK_STREAM, 0, fds);
+	if(res == -1) {
+		fuse_log(FUSE_LOG_ERR, "Running %s: socketpair() failed: %s\n",
+			 FUSERMOUNT_PROG, strerror(errno));
+		return -1;
+	}
+
+	char arg_fd_entry[ARG_FD_ENTRY_SIZE];
+	snprintf(arg_fd_entry, sizeof(arg_fd_entry), "%i", fds[0]);
+	setenv(FUSE_COMMFD_ENV, arg_fd_entry, 1);
+	/*
+	 * This helps to identify the FD hold by parent process.
+	 * In auto-unmount case, parent process can close this FD explicitly to do unmount.
+	 * The FD[1] can be got via getenv(FUSE_COMMFD2_ENV).
+	 * One potential use case is to satisfy FD-Leak checks.
+	 */
+	snprintf(arg_fd_entry, sizeof(arg_fd_entry), "%i", fds[1]);
+	setenv(FUSE_COMMFD2_ENV, arg_fd_entry, 1);
+
+	char const *const argv[] = {
+		FUSERMOUNT_PROG,
+		"-o", opts ? opts : "",
+		"--",
+		mountpoint,
+		NULL,
+	};
+
+
+	posix_spawn_file_actions_t action;
+	posix_spawn_file_actions_init(&action);
+
+	if (quiet) {
+		posix_spawn_file_actions_addopen(&action, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+		posix_spawn_file_actions_addopen(&action, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+	}
+	posix_spawn_file_actions_addclose(&action, fds[1]);
+
+	int status = fusermount_posix_spawn(&action, argv, &pid);
+
+	posix_spawn_file_actions_destroy(&action);
+
+	if(status != 0) {
+		close(fds[0]);
+		close(fds[1]);
+		fuse_log(FUSE_LOG_ERR, "posix_spawn(p)() for %s failed: %s",
+			 FUSERMOUNT_PROG, strerror(-status));
+		return -1;
+	}
+
+	// passed to child now, so can close here.
+	close(fds[0]);
+
+	int fd = receive_fd(fds[1]);
+
+	if (!mo->auto_unmount) {
+		/* with auto_unmount option fusermount3 will not exit until
+		   this socket is closed */
+		close(fds[1]);
+		waitpid(pid, NULL, 0); /* bury zombie */
+	}
+
+	if (fd >= 0)
+		fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+	return fd;
+}
+
+/*
+ * Mount using fusermount3 with --sync-init flag for bidirectional fd exchange
+ * Used by new mount API when privileged mount fails with EPERM
+ *
+ * Returns: fd of /dev/fuse opened by fusermount on success, -1 on failure
+ * On success, *sock_fd_out contains the socket fd for signaling fusermount3
+ */
+int mount_fusermount_obtain_fd(const char *mountpoint, struct mount_opts *mo,
+			       const char *opts, int *sock_fd_out,
+			       pid_t *pid_out)
+{
+	int fds[2];
+	pid_t pid;
+	int res;
+	char arg_fd_entry[ARG_FD_ENTRY_SIZE];
+	posix_spawn_file_actions_t action;
+	int fd, status;
+
+	(void)mo;
+
+	if (!mountpoint) {
+		fuse_log(FUSE_LOG_ERR, "fuse: missing mountpoint parameter\n");
+		return -1;
+	}
+
+	res = socketpair(PF_UNIX, SOCK_STREAM, 0, fds);
+	if (res == -1) {
+		fuse_log(FUSE_LOG_ERR, "Running %s: socketpair() failed: %s\n",
+			 FUSERMOUNT_PROG, strerror(errno));
+		return -1;
+	}
+
+	snprintf(arg_fd_entry, sizeof(arg_fd_entry), "%i", fds[0]);
+	setenv(FUSE_COMMFD_ENV, arg_fd_entry, 1);
+	snprintf(arg_fd_entry, sizeof(arg_fd_entry), "%i", fds[1]);
+	setenv(FUSE_COMMFD2_ENV, arg_fd_entry, 1);
+
+	char const *const argv[] = {
+		FUSERMOUNT_PROG,
+		"--sync-init",
+		"-o", opts ? opts : "",
+		"--",
+		mountpoint,
+		NULL,
+	};
+
+	posix_spawn_file_actions_init(&action);
+	posix_spawn_file_actions_addclose(&action, fds[1]);
+	status = fusermount_posix_spawn(&action, argv, &pid);
+	posix_spawn_file_actions_destroy(&action);
+
+	if (status != 0) {
+		close(fds[0]);
+		close(fds[1]);
+		return -1;
+	}
+
+	close(fds[0]);
+
+	fd = receive_fd(fds[1]);
+	if (fd < 0) {
+		close(fds[1]);
+		waitpid(pid, NULL, 0);
+		return -1;
+	}
+
+	fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+	/* Return socket fd for later signaling */
+	*sock_fd_out = fds[1];
+	*pid_out = pid;
+
+	return fd;
+}
+
+/*
+ * Send proceed signal to fusermount3 and wait for mount result
+ * Returns: 0 on success, -1 on failure
+ */
+int fuse_fusermount_proceed_mnt(int sock_fd)
+{
+	char buf = '\0';
+	ssize_t res;
+
+	/* Send proceed signal */
+	do {
+		res = send(sock_fd, &buf, 1, 0);
+	} while (res == -1 && errno == EINTR);
+
+	if (res != 1) {
+		fuse_log(FUSE_LOG_ERR, "fuse: failed to send proceed signal: %s\n",
+			 strerror(errno));
+		return -1;
+	}
+
+	/* Wait for mount result from fusermount3 (4-byte error code) */
+	int32_t status;
+
+	do {
+		res = recv(sock_fd, &status, sizeof(status), 0);
+	} while (res == -1 && errno == EINTR);
+
+	if (res != sizeof(status)) {
+		if (res == 0)
+			fuse_log(FUSE_LOG_ERR, "fuse: fusermount3 closed connection\n");
+		else
+			fuse_log(FUSE_LOG_ERR, "fuse: failed to receive mount status: %s\n",
+				 strerror(errno));
+		return -1;
+	}
+
+	if (status != 0) {
+		if (status != -EPERM)
+			fuse_log(FUSE_LOG_ERR, "fuse: fusermount3 mount failed: %s\n",
+				 strerror(-status));
+		return -1;
+	}
+
+	return 0;
+}
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
+int fuse_kern_mount_prepare(const char *mnt,
+			    struct mount_opts *mo)
+{
+	char tmp[128];
+	const char *devname = fuse_mnt_get_devname();
+	struct stat stbuf;
+	int fd;
+	int res;
+
+	if (!mnt) {
+		fuse_log(FUSE_LOG_ERR, "fuse: missing mountpoint parameter\n");
+		return -1;
+	}
+
+	res = stat(mnt, &stbuf);
+	if (res == -1) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: failed to access mountpoint %s: %s\n", mnt,
+			 strerror(errno));
+		return -1;
+	}
+
+	/* codeql[cpp/path-injection] devname is verified */
+	fd = open(devname, O_RDWR | O_CLOEXEC);
+	if (fd == -1) {
+		if (errno == ENODEV || errno == ENOENT)
+			fuse_log(
+				FUSE_LOG_ERR,
+				"fuse: device %s not found. Kernel module not loaded?\n",
+				devname);
+		else
+			fuse_log(FUSE_LOG_ERR, "fuse: failed to open %s: %s\n",
+				 devname, strerror(errno));
+		return -1;
+	}
+	if (!O_CLOEXEC)
+		fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+	snprintf(tmp, sizeof(tmp), "fd=%i,rootmode=%o,user_id=%u,group_id=%u",
+		 fd, stbuf.st_mode & S_IFMT, getuid(), getgid());
+
+	res = fuse_opt_add_opt(&mo->kernel_opts, tmp);
+	if (res == -1)
+		goto out_close;
+
+	return fd;
+
+out_close:
+	close(fd);
+	return -1;
+}
+
+#if defined(HAVE_NEW_MOUNT_API)
+/**
+ * Wrapper for fuse_kern_fsmount that accepts struct mount_opts
+ * @mnt: mountpoint
+ * @mo: mount options
+ * @mtab_opts: options recorded in /etc/mtab via fuse_mnt_add_mount_helper();
+ *             see fuse_kern_fsmount() for details
+ * @mountfd_out: see fuse_kern_fsmount()
+ *
+ * Returns: 0 on success, -1 on failure with errno set
+ */
+int fuse_kern_fsmount_mo(const char *mnt, const struct mount_opts *mo,
+			 const char *mtab_opts, int *mountfd_out)
+{
+	/* codeql[cpp/path-injection] verification is in the function */
+	const char *devname = fuse_mnt_get_devname();
+
+	/* in-process direct mount: no suid boundary, resolve by path (mnt_fd -1) */
+	return fuse_kern_fsmount(mnt, -1, mo->flags, mo->blkdev, mo->fsname,
+				 mo->subtype, devname, mo->kernel_opts,
+				 mtab_opts, mountfd_out);
+}
+#endif
+
+/**
+ * Complete the mount operation with an already-opened fd
+ * @mnt: mountpoint
+ * @mo: mount options
+ * @mtab_opts: mtab/utab record string written via fuse_mnt_add_mount_helper().
+ *             Built by fuse_kern_mount_get_base_mtab_opts(); intentionally
+ *             overlaps with mo->kernel_opts so /etc/mtab reflects the options
+ *             the kernel saw.
+ *
+ * Returns: 0 on success, -1 on failure,
+ *          FUSE_MOUNT_FALLBACK_NEEDED if fusermount should be used
+ */
+int fuse_kern_do_mount(const char *mnt, struct mount_opts *mo,
+		       const char *mtab_opts)
+{
+	char *source = NULL;
+	char *type = NULL;
+	int res;
+	const char *devname = fuse_mnt_get_devname();
+	res = -ENOMEM;
+	source = fuse_mnt_build_source(mo->fsname, mo->subtype, devname, 0);
+	type = fuse_mnt_build_type(mo->blkdev, mo->subtype);
+	if (!type || !source) {
+		fuse_log(FUSE_LOG_ERR, "%s: failed to allocate memory\n",
+			 __func__);
+		goto out_close;
+	}
+
+	res = mount(source, mnt, type, mo->flags, mo->kernel_opts);
+	if (res == -1 && errno == ENODEV && mo->subtype) {
+		/* Probably missing subtype support */
+		free(source);
+		free(type);
+
+		type = fuse_mnt_build_type(mo->blkdev, NULL);
+		if (mo->fsname) {
+			if (!mo->blkdev) {
+				source = fuse_mnt_build_source(mo->fsname, mo->subtype,
+							       devname, 1);
+			} else {
+				source = fuse_mnt_build_source(mo->fsname, NULL,
+							       devname, 0);
+			}
+		} else {
+			source = strdup(type);
+		}
+
+		if (!type || !source) {
+			fuse_log(FUSE_LOG_ERR,
+				 "%s: failed to allocate memory\n",
+				 __func__);
+			goto out_close;
+		}
+
+		res = mount(source, mnt, type, mo->flags, mo->kernel_opts);
+	}
+	if (res == -1) {
+		/*
+		 * Maybe kernel doesn't support unprivileged mounts, in this
+		 * case try falling back to fusermount3
+		 */
+		if (errno == EPERM) {
+			res = FUSE_MOUNT_FALLBACK_NEEDED;
+		} else {
+			int errno_save = errno;
+			if (mo->blkdev && errno == ENODEV &&
+			    !fuse_mnt_check_fuseblk())
+				fuse_log(FUSE_LOG_ERR,
+					 "fuse: 'fuseblk' support missing\n");
+			else
+				fuse_log(FUSE_LOG_ERR,
+					 "fuse: mount failed: %s\n",
+					 strerror(errno_save));
+		}
+
+		goto out_close;
+	}
+
+	res = fuse_mnt_add_mount_helper(mnt, source, type, mtab_opts);
+	if (res == -1)
+		goto out_umount;
+
+	free(type);
+	free(source);
+
+	return 0;
+
+out_umount:
+	umount2(mnt, MNT_DETACH | UMOUNT_NOFOLLOW); /* lazy umount */
+out_close:
+	free(type);
+	free(source);
+	return res;
+}
+
+static int fuse_mount_sys(const char *mnt, struct mount_opts *mo,
+				  const char *mtab_opts)
+{
+	int fd;
+	int res;
+
+	fd = fuse_kern_mount_prepare(mnt, mo);
+	if (fd == -1)
+		return -1;
+
+	res = fuse_kern_do_mount(mnt, mo, mtab_opts);
+	if (res) {
+		close(fd);
+		return res;
+	}
+
+	return fd;
+}
+
+/*
+ * Append the flag-mirror prefix (rw/nosuid/nodev/...) of the mtab record
+ * to @mtab_optsp, derived from the MS_* bitmask in @flags.
+ */
+static int get_mtab_flag_opts(char **mtab_optsp, int flags)
+{
+	int i;
+
+	if (!(flags & MS_RDONLY) && fuse_opt_add_opt(mtab_optsp, "rw") == -1)
+		return -1;
+
+	for (i = 0; mount_flags[i].opt != NULL; i++) {
+		if (mount_flags[i].on && (flags & mount_flags[i].flag) &&
+		    fuse_opt_add_opt(mtab_optsp, mount_flags[i].opt) == -1)
+			return -1;
+	}
+	return 0;
+}
+
+struct mount_opts *parse_mount_opts(struct fuse_args *args)
+{
+	struct mount_opts *mo;
+
+	mo = (struct mount_opts*) malloc(sizeof(struct mount_opts));
+	if (mo == NULL)
+		return NULL;
+
+	memset(mo, 0, sizeof(struct mount_opts));
+	mo->flags = MS_NOSUID | MS_NODEV;
+
+	if (args &&
+	    fuse_opt_parse(args, mo, fuse_mount_opts, fuse_mount_opt_proc) == -1)
+		goto err_out;
+
+	return mo;
+
+err_out:
+	destroy_mount_opts(mo);
+	return NULL;
+}
+
+void destroy_mount_opts(struct mount_opts *mo)
+{
+	free(mo->fsname);
+	free(mo->subtype);
+	free(mo->fusermount_opts);
+	free(mo->subtype_opt);
+	free(mo->kernel_opts);
+	free(mo->mtab_opts);
+	free(mo);
+}
+
+/*
+ * Build the mtab/utab record string for this mount: flag-mirrors of MS_*
+ * (rw/nosuid/nodev/...) + the kernel-bound -o options + the mtab-only
+ * annotations. The result is what fuse_mnt_add_mount_helper() writes into
+ * /etc/mtab (or /run/mount/utab). The overlap with @mo->kernel_opts is
+ * intentional so the mtab line reflects what the kernel saw.
+ */
+int fuse_kern_mount_get_base_mtab_opts(const struct mount_opts *mo,
+				       char **mtab_optsp)
+{
+	if (get_mtab_flag_opts(mtab_optsp, mo->flags) == -1)
+		return -1;
+	if (mo->kernel_opts && fuse_opt_add_opt(mtab_optsp, mo->kernel_opts) == -1)
+		return -1;
+	if (mo->mtab_opts &&  fuse_opt_add_opt(mtab_optsp, mo->mtab_opts) == -1)
+		return -1;
+	return 0;
+}
+
+int fuse_kern_mount(const char *mountpoint, struct mount_opts *mo)
+{
+	int res = -1;
+	char *mtab_opts = NULL;
+
+	res = -1;
+	if (fuse_kern_mount_get_base_mtab_opts(mo, &mtab_opts) == -1)
+		goto out;
+
+	res = fuse_mount_sys(mountpoint, mo, mtab_opts);
+	if (res >= 0 && mo->auto_unmount) {
+		if (setup_auto_unmount(mountpoint, 0) < 0) {
+			// Something went wrong, let's umount like in fuse_mount_sys.
+			umount2(mountpoint,
+				MNT_DETACH | UMOUNT_NOFOLLOW); /* lazy umount */
+			res = -1;
+		}
+	} else if (res == FUSE_MOUNT_FALLBACK_NEEDED) {
+		if (mo->fusermount_opts &&
+		    fuse_opt_add_opt(&mtab_opts, mo->fusermount_opts) == -1)
+			goto out;
+
+		if (mo->subtype) {
+			char *tmp_opts = NULL;
+
+			res = -1;
+			if (fuse_opt_add_opt(&tmp_opts, mtab_opts) == -1 ||
+			    fuse_opt_add_opt(&tmp_opts, mo->subtype_opt) == -1) {
+				free(tmp_opts);
+				goto out;
+			}
+
+			res = fuse_mount_fusermount(mountpoint, mo, tmp_opts, 1);
+			free(tmp_opts);
+			if (res == -1)
+				res = fuse_mount_fusermount(mountpoint, mo,
+							    mtab_opts, 0);
+		} else {
+			res = fuse_mount_fusermount(mountpoint, mo, mtab_opts, 0);
+		}
+	}
+out:
+	free(mtab_opts);
+	return res;
+}
+
+char *fuse_mnt_kernel_opts(const struct mount_opts *mo)
+{
+	if (mo->kernel_opts)
+		return strdup(mo->kernel_opts);
+	return NULL;
+}
+
+char *fuse_mnt_mtab_opts(const struct mount_opts *mo)
+{
+	if (mo->mtab_opts)
+		return strdup(mo->mtab_opts);
+	return NULL;
+}
+
+unsigned int fuse_mnt_flags(const struct mount_opts *mo)
+{
+	return mo->flags;
+}

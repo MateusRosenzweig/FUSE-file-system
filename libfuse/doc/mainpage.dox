@@ -1,0 +1,67 @@
+/*!
+\mainpage libfuse API documentation
+
+FUSE (Filesystem in Userspace) is an interface for userspace programs
+to export a filesystem to the Linux kernel. The FUSE project consists
+of two components: the *fuse* kernel module (maintained in the regular
+kernel repositories) and the *libfuse* userspace library. libfuse
+provides the reference implementation for communicating with the FUSE
+kernel module.
+
+A FUSE file system is typically implemented as a standalone
+application that links with libfuse. libfuse provides functions to
+mount the file system, unmount it, read requests from the kernel, and
+send responses back.
+
+
+## Getting started ##
+
+libfuse offers two APIs: a "high-level", synchronous API, and a
+"low-level" asynchronous API. In both cases, incoming requests from
+the kernel are passed to the main program using callbacks. When using
+the high-level API, the callbacks may work with file names and paths
+instead of inodes, and processing of a request finishes when the
+callback function returns. When using the low-level API, the callbacks
+must work with inodes and responses must be sent explicitly using a
+separate set of API functions.
+
+The high-level API that is primarily specified in fuse.h. The
+low-level API that is primarily documented in fuse_lowlevel.h.
+
+## Running a filesystem as a systemd service ##
+
+A FUSE server can also be run as a sandboxed, socket-activated systemd
+service rather than as a child of the mounting process. In this model the
+server runs under its own unprivileged identity and in private namespaces,
+while a small setuid helper (fuservicemount3) performs the mount on its
+behalf. Servers use the service API in fuse_service.h; the service_hl.c and
+service_ll.c examples show the high- and low-level variants.
+
+The README.service-mount and README.service-mount-dev files in the source
+*doc* directory document this feature for administrators and filesystem
+authors respectively.
+
+## Examples ##
+
+FUSE comes with several examples in the <a
+href="files.html">examples</a> directory. A good starting point are
+hello.c (for the high-level API) and hello_ll.c (for the low-level
+API).
+
+## FUSE internals ##
+
+The authoritative source of information about libfuse internals
+(including the protocol used for communication with the FUSE kernel
+module) is the source code.
+
+However, some people have kindly documented different aspects of FUSE
+in a more beginner friendly way. While this information is
+increasingly out of date, it still provides a good overview:
+
+- Bharat Vangoor et al have included an overview of the FUSE internals
+  in a <a href="fast17-vangoor.pdf">paper evaluating FUSE performance</a>.
+
+- Some documentation of the kernel-userspace protocol is available on
+  the <a href="https://github.com/libfuse/libfuse/wiki/">libfuse wiki</a>.
+
+*/
